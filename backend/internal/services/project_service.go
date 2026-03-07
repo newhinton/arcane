@@ -1908,19 +1908,39 @@ func (s *ProjectService) persistUpdatedProjectFiles(ctx context.Context, proj *m
 }
 
 func (s *ProjectService) validateComposeContentForUpdate(ctx context.Context, projectPath, projectName, composeContent string, envContent *string) (err error) {
-	cleanup, err := prepareComposeValidationEnvFile(ctx, projectPath, envContent)
-	if err != nil {
-		return err
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("compose file contains invalid syntax: %v", recovered)
 		}
 	}()
+
+	// Load safe environment variables for ${VAR} interpolation during validation.
+	// Only the project's own .env is used — host process env and .env.global are
+	// both intentionally excluded to prevent leaking Arcane secrets.
+	fullEnvMap := make(projects.EnvMap)
+	if absWorkdir, absErr := filepath.Abs(projectPath); absErr == nil {
+		fullEnvMap["PWD"] = absWorkdir
+	}
+
+	// Prefer the provided new environment content if available, otherwise read from disk.
+	if envContent != nil {
+		if fileEnv, envErr := projects.ParseProjectEnvContent(*envContent, fullEnvMap); envErr != nil {
+			return fmt.Errorf("parse provided env content: %w", envErr)
+		} else {
+			for k, v := range fileEnv {
+				fullEnvMap[k] = v
+			}
+		}
+	} else {
+		projectEnvPath := filepath.Join(projectPath, ".env")
+		if fileEnv, envErr := projects.ParseProjectEnvFile(projectEnvPath, fullEnvMap); envErr != nil {
+			return fmt.Errorf("parse project env file: %w", envErr)
+		} else {
+			for k, v := range fileEnv {
+				fullEnvMap[k] = v
+			}
+		}
+	}
 
 	validationProjectName := normalizeComposeProjectName(projectName)
 	cfg := composetypes.ConfigDetails{
@@ -1929,41 +1949,63 @@ func (s *ProjectService) validateComposeContentForUpdate(ctx context.Context, pr
 		ConfigFiles: []composetypes.ConfigFile{
 			{Filename: filepath.Join(projectPath, "compose.yaml"), Content: []byte(composeContent)},
 		},
+		Environment: composetypes.Mapping(fullEnvMap),
 	}
 
-	_, err = loader.LoadWithContext(ctx, cfg, func(opts *loader.Options) {
-		if validationProjectName != "" {
-			opts.SetProjectName(validationProjectName, true)
-		}
+	err = withTransientValidationEnvFile(projectPath, envContent, func() error {
+		_, loadErr := loader.LoadWithContext(ctx, cfg, func(opts *loader.Options) {
+			if validationProjectName != "" {
+				opts.SetProjectName(validationProjectName, true)
+			}
+		})
+		return loadErr
 	})
 
 	return err
 }
 
-func prepareComposeValidationEnvFile(ctx context.Context, projectPath string, envContent *string) (func(), error) {
-	validationEnvPath := filepath.Join(projectPath, ".env")
-	if _, err := os.Stat(validationEnvPath); err == nil {
-		return nil, nil
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to stat project env file: %w", err)
+func withTransientValidationEnvFile(projectPath string, envContent *string, run func() error) (err error) {
+	envPath := filepath.Join(projectPath, ".env")
+	originalContent, readErr := os.ReadFile(envPath)
+	originalExists := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return fmt.Errorf("prepare env file for compose validation: %w", readErr)
 	}
 
-	validationEnvContent := ""
-	if envContent != nil {
-		validationEnvContent = *envContent
-	}
-
-	if err := fs.WriteFileWithPerm(validationEnvPath, validationEnvContent, common.FilePerm); err != nil {
-		return nil, fmt.Errorf("failed to prepare env file for compose validation: %w", err)
-	}
-
-	cleanup := func() {
-		if err := os.Remove(validationEnvPath); err != nil && !os.IsNotExist(err) {
-			slog.WarnContext(ctx, "failed to remove temporary env file after compose validation", "path", validationEnvPath, "error", err)
+	shouldWrite := envContent != nil || !originalExists
+	if shouldWrite {
+		content := ""
+		if envContent != nil {
+			content = *envContent
 		}
+		if writeErr := fs.WriteEnvFile(projectPath, projectPath, content); writeErr != nil {
+			return fmt.Errorf("prepare env file for compose validation: %w", writeErr)
+		}
+
+		defer func() {
+			var restoreErr error
+			switch {
+			case originalExists:
+				restoreErr = fs.WriteEnvFile(projectPath, projectPath, string(originalContent))
+			case envContent != nil:
+				restoreErr = os.Remove(envPath)
+			default:
+				restoreErr = os.Remove(envPath)
+			}
+
+			if restoreErr != nil && !os.IsNotExist(restoreErr) {
+				if err == nil {
+					err = fmt.Errorf("restore env file after compose validation: %w", restoreErr)
+				}
+			}
+		}()
 	}
 
-	return cleanup, nil
+	if run == nil {
+		return nil
+	}
+
+	return run()
 }
 
 func (s *ProjectService) applyProjectRenameIfNeeded(proj *models.Project, name *string, projectsDirectory string) error {
